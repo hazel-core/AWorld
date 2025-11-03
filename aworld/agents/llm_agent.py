@@ -446,7 +446,7 @@ class Agent(BaseAgent[Observation, List[ActionModel]]):
 
         _group_name = None
         # agents and tools exist simultaneously, more than one agent/tool name
-        if (agents and tools) or len(agents) > 1 or len(tools) > 1 or (len(agents) == 1 and agents[0].tool_name):
+        if (agents and tools) or len(agents) > 1 or len(tools) > 1 or (len(agents) == 1 and agents[0].tool_name and agents[0].tool_call_id):
             _group_name = f"{self.id()}_{uuid.uuid1().hex}"
 
         # complex processing
