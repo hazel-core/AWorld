@@ -1,9 +1,10 @@
+import json
 import os
 from typing import Any, Dict, List, Generator, AsyncGenerator
 
+from aworld.core.llm_provider import LLMProviderBase
 from aworld.utils import import_package
 from aworld.logs.util import logger
-from aworld.core.llm_provider import LLMProviderBase
 from aworld.models.model_response import ModelResponse, LLMResponseError
 
 
@@ -81,16 +82,44 @@ class AnthropicProvider(LLMProviderBase):
         anthropic_messages = []
         system_content = None
 
+    
         for msg in messages:
             role = msg.get("role", "")
-            content = msg.get("content", "")
-
+            content = msg.get("content", "Empty")
+            
+            if content == "":
+                content = "Empty"
+                
             if role == "system":
                 system_content = content
             elif role == "user":
                 anthropic_messages.append({"role": "user", "content": content})
             elif role == "assistant":
-                anthropic_messages.append({"role": "assistant", "content": content})
+                anthropic_messages.append({
+                    "role": "assistant", 
+                    "content": [
+                        {'type': 'text', 'text': content},
+                        *[
+                            {
+                                'type': 'tool_use',
+                                'id': tool_call['id'],
+                                'name': tool_call['function']['name'],
+                                'input': json.loads(tool_call['function']['arguments']) if isinstance(tool_call['function']['arguments'], str) else tool_call['function']['arguments']
+                            } for tool_call in msg.get("tool_calls", [])
+                        ]
+                    ]
+                })
+            elif role == "tool":
+                anthropic_messages.append({
+                    'role': 'user',
+                    'content': [
+                        {
+                            'type': 'tool_result',
+                            'tool_use_id': msg.get("tool_call_id"),
+                            'content': msg.get("content", ""),
+                        }
+                    ]
+                })
 
         return {
             "messages": anthropic_messages,
@@ -163,7 +192,7 @@ class AnthropicProvider(LLMProviderBase):
             system_content = processed_data["system"]
             anthropic_params = self.get_anthropic_params(processed_messages, system_content, temperature, max_tokens,
                                                          stop, **kwargs)
-            response = self.provider.visited_messages.create(**anthropic_params)
+            response = self.provider.messages.create(**anthropic_params)
 
             return self.postprocess_response(response)
         except Exception as e:
@@ -199,7 +228,7 @@ class AnthropicProvider(LLMProviderBase):
             anthropic_params = self.get_anthropic_params(processed_messages, system_content, temperature, max_tokens,
                                                          stop, **kwargs)
             anthropic_params["stream"] = True
-            response_stream = self.provider.visited_messages.create(**anthropic_params)
+            response_stream = self.provider.messages.create(**anthropic_params)
 
             for chunk in response_stream:
                 if not chunk:
@@ -240,7 +269,7 @@ class AnthropicProvider(LLMProviderBase):
             anthropic_params = self.get_anthropic_params(processed_messages, system_content, temperature, max_tokens,
                                                          stop, **kwargs)
             anthropic_params["stream"] = True
-            response_stream = await self.async_provider.visited_messages.create(**anthropic_params)
+            response_stream = await self.async_provider.messages.create(**anthropic_params)
 
             async for chunk in response_stream:
                 if not chunk:
@@ -280,7 +309,7 @@ class AnthropicProvider(LLMProviderBase):
             system_content = processed_data["system"]
             anthropic_params = self.get_anthropic_params(processed_messages, system_content, temperature, max_tokens,
                                                          stop, **kwargs)
-            response = await self.async_provider.visited_messages.create(**anthropic_params)
+            response = await self.async_provider.messages.create(**anthropic_params)
 
             return self.postprocess_response(response)
         except Exception as e:
@@ -294,25 +323,46 @@ class AnthropicProvider(LLMProviderBase):
                              max_tokens: int = None,
                              stop: List[str] = None,
                              **kwargs) -> Dict[str, Any]:
-        if "tools" in kwargs:
+        
+        logger.info("Preparing parameters for Anthropic API call")
+        
+        if "tools" in kwargs and kwargs["tools"]:
             openai_tools = kwargs["tools"]
             claude_tools = []
+            seen_tools = []
+            tool_names = []
+            
+            if not isinstance(openai_tools, list):
+                raise ValueError("Tools must be a list of dictionaries in OpenAI format.")
 
             for tool in openai_tools:
                 if tool["type"] == "function":
-                    claude_tool = {
-                        "name": tool["name"],
-                        "description": tool["description"],
-                        "input_schema": {
-                            "type": "object",
-                            "properties": tool["parameters"]["properties"],
-                            "required": tool["parameters"].get("required", [])
+                    tool_names.append(tool['function']["name"]) 
+                    if tool['function']["name"] not in seen_tools:
+                        claude_tool = {
+                            "name": tool['function']["name"],
+                            "description": tool['function']["description"],
+                            "input_schema": {
+                                "type": "object",
+                                "properties": tool['function']["parameters"]["properties"],
+                                "required": tool['function']["parameters"].get("required", [])
+                            }
                         }
-                    }
-                    claude_tools.append(claude_tool)
+                        seen_tools.append(tool['function']["name"])
+                        claude_tools.append(claude_tool)
 
+            # logger.warning("_" * 100)
+            # logger.warning(f"Claude tools {len(claude_tools)}, OpenAI tools {len(openai_tools)}")
+            # logger.warning("\n".join(seen_tools))
+            # logger.warning("_"*100)
+            # logger.warning("\n".join([i for i in tool_names if i not in seen_tools]))
             kwargs["tools"] = claude_tools
-
+        elif kwargs.get("tools") is None:
+            logger.info("No tools detected in kwargs, using default Claude format")
+            
+        
+        from pprint import pprint
+            
         anthropic_params = {
             "model": kwargs.get("model_name", self.model_name or ""),
             "messages": messages,
@@ -324,7 +374,7 @@ class AnthropicProvider(LLMProviderBase):
 
         if "tools" in kwargs and kwargs["tools"]:
             anthropic_params["tools"] = kwargs["tools"]
-            anthropic_params["tool_choice"] = kwargs.get("tool_choice", "auto")
+            # anthropic_params["tool_choice"] = kwargs.get("tool_choice", "auto")
 
         for param in ["top_p", "top_k", "metadata", "stream"]:
             if param in kwargs:

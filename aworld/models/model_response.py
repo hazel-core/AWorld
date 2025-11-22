@@ -1,9 +1,13 @@
+import ast
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 import json
 from pydantic import BaseModel
 
 from aworld.logs.util import logger
+
+import json
+import base64
 
 
 class LLMResponseError(Exception):
@@ -46,6 +50,7 @@ class ToolCall(BaseModel):
     id: str
     type: str = "function"
     function: Function = None
+    extras: dict = {}
 
     # name: str = None
     # arguments: str = None
@@ -66,6 +71,7 @@ class ToolCall(BaseModel):
 
         tool_id = data.get('id', f"call_{hash(str(data)) & 0xffffffff:08x}")
         tool_type = data.get('type', 'function')
+        tool_extras = data.get('extra_content', {})
 
         function_data = data.get('function', {})
         name = function_data.get('name')
@@ -81,6 +87,7 @@ class ToolCall(BaseModel):
             id=tool_id,
             type=tool_type,
             function=function,
+            extras = tool_extras
             # name=name,
             # arguments=arguments,
         )
@@ -95,6 +102,7 @@ class ToolCall(BaseModel):
         return {
             "id": self.id,
             "type": self.type,
+            "extra_content": self.extras,
             "function": {
                 "name": self.function.name,
                 "arguments": self.function.arguments
@@ -178,6 +186,7 @@ class ModelResponse:
         elif isinstance(message, dict):
             return message.get(key, default_value)
         return default_value
+
 
     @classmethod
     def from_openai_response(cls, response: Any) -> 'ModelResponse':
@@ -267,14 +276,15 @@ class ModelResponse:
                     tool_call_dict = {
                         "id": tool_call.id if hasattr(tool_call,
                                                       'id') else f"call_{hash(str(tool_call)) & 0xffffffff:08x}",
-                        "type": tool_call.type if hasattr(tool_call, 'type') else "function"
+                        "type": tool_call.type if hasattr(tool_call, 'type') else "function",
+                        'extra_content': tool_call.extra_content if hasattr(tool_call, 'extra_content') else "None"
                     }
 
                     if hasattr(tool_call, 'function'):
                         function = tool_call.function
                         tool_call_dict["function"] = {
                             "name": function.name if hasattr(function, 'name') else None,
-                            "arguments": function.arguments if hasattr(function, 'arguments') else None
+                            "arguments": function.arguments if hasattr(function, 'arguments') else None,
                         }
                     processed_tool_calls.append(ToolCall.from_dict(tool_call_dict))
 
@@ -657,3 +667,141 @@ class ModelResponse:
                 result[key] = value
 
         return result
+    
+    @classmethod
+    def from_gemini_response(cls, response: Any, model_name: str) -> 'ModelResponse':
+        """
+        Create ModelResponse from Google GenAI response object
+        """
+        if not response or not response.candidates:
+            error_msg = "No candidates returned"
+            if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
+                error_msg += f": {response.prompt_feedback}"
+            raise LLMResponseError(error_msg, model_name, response)
+
+        candidate = response.candidates[0]
+        
+        content_text = ""
+        processed_tool_calls = []
+        
+        if candidate.content and candidate.content.parts:
+            for part in candidate.content.parts:
+                if part.text:
+                    content_text += part.text
+                
+                if part.function_call:
+                    args = part.function_call.args
+                    # logger.warning(args)
+                    if isinstance(args, dict):
+                        args = json.dumps(args)
+                    
+                    # --- FIX: Capture Real ID ---
+                    # We must use the ID provided by Google to satisfy the thought_signature requirement.
+                    # We only fallback to a generated ID if absolutely necessary (which usually implies a mocked response).
+                    real_id = getattr(part.function_call, 'id', None)
+                    tool_id = real_id if real_id else f"call_{part.function_call.name}"
+                    
+                    tool_call_dict = {
+                        "id": tool_id,
+                        "type": "function",
+                        "function": {
+                            "name": part.function_call.name,
+                            "arguments": args
+                        },
+                        "extra_content":{
+                            "thought_signature": base64.b64encode(part.thought_signature).decode('ascii')
+                        }
+                    }
+                    processed_tool_calls.append(ToolCall.from_dict(tool_call_dict))
+
+        # Extract Usage
+        usage = {
+            "completion_tokens": 0,
+            "prompt_tokens": 0,
+            "total_tokens": 0
+        }
+        if hasattr(response, 'usage_metadata') and response.usage_metadata:
+            usage = {
+                "completion_tokens": response.usage_metadata.candidates_token_count or 0,
+                "prompt_tokens": response.usage_metadata.prompt_token_count or 0,
+                "total_tokens": response.usage_metadata.total_token_count or 0
+            }
+
+        message = {
+            "role": "assistant",
+            "content": content_text,
+            "tool_calls": [tc.to_dict() for tc in processed_tool_calls] if processed_tool_calls else None
+        }
+
+        return cls(
+            id=f"gemini-{hash(str(response)) & 0xffffffff:08x}",
+            model=model_name,
+            content=content_text,
+            tool_calls=processed_tool_calls or None,
+            usage=usage,
+            raw_response=response,
+            message=message
+        )
+
+    @classmethod
+    def from_gemini_stream_chunk(cls, chunk: Any, model_name: str) -> 'ModelResponse':
+        """
+        Create ModelResponse from Google GenAI stream chunk
+        """
+        if not chunk or not chunk.candidates:
+            return None
+
+        candidate = chunk.candidates[0]
+        content_text = ""
+        processed_tool_calls = []
+
+        if candidate.content and candidate.content.parts:
+            for part in candidate.content.parts:
+                if part.text:
+                    content_text += part.text
+                if part.function_call:
+                    args = part.function_call.args
+                    if isinstance(args, dict):
+                        args = json.dumps(args)
+                    
+                    # --- FIX: Capture Real ID in Stream ---
+                    real_id = getattr(part.function_call, 'id', None)
+                    tool_id = real_id if real_id else f"call_{part.function_call.name}"
+                    
+                    tool_call_dict = {
+                        "id": tool_id,
+                        "type": "function",
+                        "function": {
+                            "name": part.function_call.name,
+                            "arguments": args
+                        },
+                        "extra_content":{
+                            "thought_signature": base64.b64encode(part.thought_signature).decode('ascii')
+                        }
+                    }
+                    processed_tool_calls.append(ToolCall.from_dict(tool_call_dict))
+
+        usage = None
+        if hasattr(chunk, 'usage_metadata') and chunk.usage_metadata:
+            usage = {
+                "completion_tokens": chunk.usage_metadata.candidates_token_count or 0,
+                "prompt_tokens": chunk.usage_metadata.prompt_token_count or 0,
+                "total_tokens": chunk.usage_metadata.total_token_count or 0
+            }
+
+        message = {
+            "role": "assistant",
+            "content": content_text,
+            "tool_calls": [tc.to_dict() for tc in processed_tool_calls] if processed_tool_calls else None,
+            "is_chunk": True
+        }
+
+        return cls(
+            id=f"gemini-chunk-{hash(str(chunk)) & 0xffffffff:08x}",
+            model=model_name,
+            content=content_text if content_text else None,
+            tool_calls=processed_tool_calls or None,
+            usage=usage,
+            raw_response=chunk,
+            message=message
+        )   

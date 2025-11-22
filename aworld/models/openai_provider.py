@@ -4,6 +4,7 @@ import traceback
 from typing import Any, Dict, List, Generator, AsyncGenerator
 
 from openai import OpenAI, AsyncOpenAI
+from openai import AzureOpenAI, AsyncAzureOpenAI
 
 from aworld.config.conf import ClientType
 from aworld.core.llm_provider import LLMProviderBase
@@ -449,6 +450,48 @@ class OpenAIProvider(LLMProviderBase):
             if param in llm_params and llm_params[param] is not None:
                 openai_params[param] = llm_params[param]
 
+        if "tools" in kwargs and kwargs["tools"]:
+            openai_tools = kwargs["tools"]
+            deduplicated_tools = []
+            seen_tools = []
+            tool_names = []
+            
+            if not isinstance(openai_tools, list):
+                raise ValueError("Tools must be a list of dictionaries in OpenAI format.")
+
+            for tool in openai_tools:
+                if tool["type"] == "function":
+                    tool_names.append(tool['function']["name"]) 
+                    if tool['function']["name"] not in seen_tools:
+                        seen_tools.append(tool['function']["name"])
+                        deduplicated_tools.append(tool)
+
+            openai_params["tools"] = deduplicated_tools
+
+
+
+        if "anthropic" in openai_params["model"]:
+            openai_params["max_tokens"]= 8192
+
+        if "gpt-5" in openai_params['model'] or "o3" in openai_params['model']:
+            # openai_params["max_completion_tokens"] = 16384  
+            openai_params["reasoning_effort"] = "high"
+            del openai_params["max_tokens"]  
+            del openai_params["temperature"] 
+
+
+
+        if "gemini" in openai_params["model"]:
+
+
+            openai_params['reasoning_effort'] = "high"  
+            openai_params['timeout'] = 1200
+            del openai_params["max_tokens"]  # Remove max_tokens if set
+            del openai_params["temperature"]  # Remove max_completion_tokens if set
+            del openai_params["stop"]
+            # del openai_params["tools"]
+            # openai_params['tool_choice'] = "auto"  # Set tool choice to auto for Gemini models
+            
         return openai_params
 
     def speech_to_text(self,
@@ -601,15 +644,12 @@ class OpenAIProvider(LLMProviderBase):
 class AzureOpenAIProvider(OpenAIProvider):
     """Azure OpenAI provider implementation.
     """
-
     def _init_provider(self):
         """Initialize Azure OpenAI provider.
-
+        
         Returns:
             Azure OpenAI provider instance.
         """
-        from langchain_openai import AzureChatOpenAI
-
         # Get API key
         api_key = self.api_key
         if not api_key:
@@ -618,22 +658,73 @@ class AzureOpenAIProvider(OpenAIProvider):
             if not api_key:
                 raise ValueError(
                     f"Azure OpenAI API key not found, please set {env_var} environment variable or provide it in the parameters")
-
-        # Get API version
-        api_version = self.kwargs.get("api_version", "") or os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
-
-        # Get endpoint
+        
+        # Get Azure endpoint
         azure_endpoint = self.base_url
         if not azure_endpoint:
             azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "")
             if not azure_endpoint:
                 raise ValueError(
-                    "Azure OpenAI endpoint not found, please set AZURE_OPENAI_ENDPOINT environment variable or provide it in the parameters")
+                    "Azure OpenAI endpoint not found, please set AZURE_OPENAI_ENDPOINT environment variable or provide it in base_url parameter")
+        
+        # Get API version
+        api_version = self.kwargs.get("api_version") or os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
 
-        return AzureChatOpenAI(
-            model=self.model_name or "gpt-4o",
-            temperature=self.kwargs.get("temperature", 0.0),
-            api_version=api_version,
+        self.is_http_provider = False
+        if self.kwargs.get("client_type", ClientType.SDK) == ClientType.HTTP:
+            logger.info(f"Using HTTP provider for Azure OpenAI")
+            self.http_provider = LLMHTTPHandler(
+                base_url=azure_endpoint,
+                api_key=api_key,
+                model_name=self.model_name,
+                max_retries=self.kwargs.get("max_retries", 3)
+            )
+            self.is_http_provider = True
+            return self.http_provider
+        else:
+            return AzureOpenAI(
+                api_key=api_key,
+                azure_endpoint=azure_endpoint,
+                api_version=api_version,
+                timeout=self.kwargs.get("timeout", 180),
+                max_retries=self.kwargs.get("max_retries", 3)
+            )
+
+    def _init_async_provider(self):
+        """Initialize async Azure OpenAI provider.
+
+        Returns:
+            Async Azure OpenAI provider instance.
+        """
+        # Get API key
+        api_key = self.api_key
+        if not api_key:
+            env_var = "AZURE_OPENAI_API_KEY"
+            api_key = os.getenv(env_var, "")
+            if not api_key:
+                raise ValueError(
+                    f"Azure OpenAI API key not found, please set {env_var} environment variable or provide it in the parameters")
+        
+        # Get Azure endpoint
+        azure_endpoint = self.base_url
+        if not azure_endpoint:
+            azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+            if not azure_endpoint:
+                raise ValueError(
+                    "Azure OpenAI endpoint not found, please set AZURE_OPENAI_ENDPOINT environment variable or provide it in base_url parameter")
+        
+        # Get API version
+        api_version = self.kwargs.get("api_version") or os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+
+        return AsyncAzureOpenAI(
+            api_key=api_key,
             azure_endpoint=azure_endpoint,
-            api_key=api_key
+            api_version=api_version,
+            timeout=self.kwargs.get("timeout", 180),
+            max_retries=self.kwargs.get("max_retries", 3)
         )
+
+    @classmethod
+    def supported_models(cls) -> list[str]:
+        # Azure OpenAI model names are typically deployment names, so this should be more flexible
+        return ["gpt-4o", "gpt-4", "gpt-35-turbo", "gpt-4o-mini", "whisper-1"]

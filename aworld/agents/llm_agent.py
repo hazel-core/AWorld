@@ -771,7 +771,9 @@ class Agent(BaseAgent[Observation, List[ActionModel]]):
                     **kwargs
                 )
 
-            logger.info(f"Execute response: {json.dumps(llm_response.to_dict(), ensure_ascii=False)}")
+            # logger.warning(llm_response)
+            # logger.warning(type(llm_response))
+            # logger.info(f"Execute response: {json.dumps(llm_response.to_dict(), ensure_ascii=False)}")
             if llm_response:
                 usage_process(llm_response.usage, message.context)
         except Exception as e:
